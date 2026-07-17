@@ -201,6 +201,7 @@ def _codex_wait_notice_recovery(
     call_start: float,
     idle_enabled: bool,
     idle_timeout: float,
+    elapsed: float,
 ) -> str:
     """Describe the earliest enabled Codex watchdog on the call timeline."""
     deadlines: list[float] = []
@@ -211,7 +212,7 @@ def _codex_wait_notice_recovery(
             deadlines.append(ttfb_timeout)
     elif idle_enabled and math.isfinite(idle_timeout):
         deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
-    if not deadlines:
+    if not deadlines or min(deadlines) <= elapsed:
         return ""
     return f"; auto-reconnect at {int(min(deadlines))}s"
 
@@ -644,6 +645,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 call_start=_call_start,
                 idle_enabled=_codex_idle_enabled,
                 idle_timeout=_codex_idle_timeout,
+                elapsed=_elapsed,
             )
             agent._emit_wait_notice(
                 f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
