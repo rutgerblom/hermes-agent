@@ -18,12 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
-from hermes_constants import (
-    get_hermes_home,
-    get_hermes_home_override,
-    reset_hermes_home_override,
-    set_hermes_home_override,
-)
+from hermes_constants import get_hermes_home, get_hermes_home_override
+from agent.profile_runtime_scope import profile_runtime_scope
+from agent.secret_scope import set_multiplex_active
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
@@ -48,6 +45,9 @@ _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
 )
+# Shared Desktop/TUI backends select profiles per RPC. Credential reads must
+# therefore fail closed unless a profile runtime scope is active.
+set_multiplex_active(True)
 
 
 # ── Panic logger ─────────────────────────────────────────────────────
@@ -1162,6 +1162,26 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+def _resolved_profile_home(params: dict | None = None) -> Path:
+    """Resolve exactly one profile home for an RPC without silent fallback.
+
+    Sessions retain their selected home.  A caller may omit ``profile`` after
+    creation, but may not switch a live session to a different profile.
+    """
+    params = params or {}
+    requested = str(params.get("profile") or "").strip()
+    requested_home = _profile_home(requested) if requested else None
+    if requested and requested_home is None:
+        raise ValueError("selected profile is unavailable")
+
+    session = _sessions.get(str(params.get("session_id") or ""))
+    raw_session_home = session.get("profile_home") if isinstance(session, dict) else None
+    session_home = Path(raw_session_home).resolve() if raw_session_home else None
+    if requested_home is not None and session_home is not None and requested_home != session_home:
+        raise ValueError("selected profile does not match session profile")
+    return requested_home or session_home or Path(_hermes_home).resolve()
+
+
 def _profile_scoped(handler):
     """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
 
@@ -1173,14 +1193,8 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
-        if home is None:
+        with profile_runtime_scope(_resolved_profile_home(params)):
             return handler(rid, params)
-        token = set_hermes_home_override(home)
-        try:
-            return handler(rid, params)
-        finally:
-            reset_hermes_home_override(token)
 
     return wrapper
 
@@ -1646,8 +1660,13 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        try:
+            selected_home = _resolved_profile_home(_params)
+        except ValueError as exc:
+            return _err(_rid, 4008, str(exc))
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            with profile_runtime_scope(selected_home):
+                return handle_request(req)
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
@@ -1833,16 +1852,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
         worker = None
         notify_registered = False
-        home_token = None
         profile_home = current.get("profile_home")
+        runtime_scope = profile_runtime_scope(profile_home or _hermes_home)
         try:
+            runtime_scope.__enter__()
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
             session_db = None
             if profile_home:
-                home_token = set_hermes_home_override(profile_home)
                 try:
                     from hermes_state import SessionDB
 
@@ -1953,8 +1972,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
-            if home_token is not None:
-                reset_hermes_home_override(home_token)
+            runtime_scope.__exit__(None, None, None)
             # _attach_worker already closed the worker if this session was
             # reaped mid-build; only the late notify registration can still
             # leak (session.close unregistered before _build registered it).
@@ -2796,10 +2814,25 @@ def _ensure_skin_watcher() -> None:
     threading.Thread(target=_loop, name="hermes-skin-watcher", daemon=True).start()
 
 
+def _selected_runtime_env(name: str, default: str = "") -> str:
+    """Read profile-scoped launch state without breaking standalone TUI flags.
+
+    Shared dashboard dispatch always establishes ``profile_runtime_scope``
+    before this resolver.  Ambient launch values are forbidden inside that
+    scope; without one, standalone TUI keeps its documented launch behavior.
+    """
+    from agent.profile_runtime_scope import profile_secret
+    from agent.secret_scope import current_secret_scope
+
+    if current_secret_scope() is None:
+        return str(os.environ.get(name) or default)
+    return profile_secret(name, default)
+
+
 def _resolve_model() -> str:
     env = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        _selected_runtime_env("HERMES_MODEL")
+        or _selected_runtime_env("HERMES_INFERENCE_MODEL")
     ).strip()
     if env:
         return env
@@ -2896,13 +2929,13 @@ def _config_model_target() -> tuple[str, str]:
 
 def _resolve_startup_runtime() -> tuple[str, str | None]:
     model = _resolve_model()
-    explicit_provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip()
+    explicit_provider = _selected_runtime_env("HERMES_TUI_PROVIDER").strip()
     if explicit_provider:
         return model, explicit_provider
 
     explicit_model = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        _selected_runtime_env("HERMES_MODEL")
+        or _selected_runtime_env("HERMES_INFERENCE_MODEL")
     ).strip()
     if not explicit_model:
         return model, None
@@ -2917,7 +2950,7 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
                 if isinstance(cfg, dict)
                 else ""
             )
-            or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+            or _selected_runtime_env("HERMES_INFERENCE_PROVIDER").strip().lower()
             or "auto"
         )
         detected = detect_static_provider_for_model(explicit_model, current_provider)
@@ -7349,10 +7382,9 @@ def _(rid, params: dict) -> dict:
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
     _enable_gateway_prompts()
-    home_token = (
-        set_hermes_home_override(str(profile_home)) if profile_home is not None else None
-    )
+    runtime_scope = profile_runtime_scope(profile_home or _hermes_home)
     try:
+        runtime_scope.__enter__()
         db.reopen_session(target)
         # One lineage SELECT feeds both projections (see the interactive resume
         # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
@@ -7391,8 +7423,7 @@ def _(rid, params: dict) -> dict:
             lease.release()
         return _err(rid, 5000, f"resume failed: {e}")
     finally:
-        if home_token is not None:
-            reset_hermes_home_override(home_token)
+        runtime_scope.__exit__(None, None, None)
 
     # Double-checked locking: another concurrent resume may have created the
     # live session while we were building. Re-check under the lock; if it won,
@@ -7418,12 +7449,9 @@ def _(rid, params: dict) -> dict:
             payload["resumed"] = target
             return _ok(rid, payload)
         try:
-            init_home_token = (
-                set_hermes_home_override(str(profile_home))
-                if profile_home is not None
-                else None
-            )
+            init_runtime_scope = profile_runtime_scope(profile_home or _hermes_home)
             try:
+                init_runtime_scope.__enter__()
                 _init_session(
                     sid,
                     target,
@@ -7435,8 +7463,7 @@ def _(rid, params: dict) -> dict:
                     source=source,
                 )
             finally:
-                if init_home_token is not None:
-                    reset_hermes_home_override(init_home_token)
+                init_runtime_scope.__exit__(None, None, None)
             if sid in _sessions:
                 if stored_runtime_overrides.get("model_override") is not None:
                     _sessions[sid]["model_override"] = stored_runtime_overrides[
@@ -10175,10 +10202,9 @@ def _(rid, params: dict) -> dict:
             from hermes_state import SessionDB
 
             branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
-        home_token = (
-            set_hermes_home_override(parent_home) if parent_home else None
-        )
+        runtime_scope = profile_runtime_scope(parent_home or _hermes_home)
         try:
+            runtime_scope.__enter__()
             tokens = _set_session_context(new_key)
             try:
                 agent = _make_agent(
@@ -10202,8 +10228,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=parent_home,
             )
         finally:
-            if home_token is not None:
-                reset_hermes_home_override(home_token)
+            runtime_scope.__exit__(None, None, None)
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
     except Exception as e:
@@ -11262,7 +11287,7 @@ def _run_prompt_submit(
     def run():
         approval_token = None
         session_tokens = []
-        home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
+        runtime_scope = None
         goal_followup = None  # set by the post-turn goal hook below
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -11293,8 +11318,8 @@ def _run_prompt_submit(
                 ui_session_id=sid,
             )
             _profile_home_str = session.get("profile_home")
-            if _profile_home_str:
-                home_token = set_hermes_home_override(_profile_home_str)
+            runtime_scope = profile_runtime_scope(_profile_home_str or _hermes_home)
+            runtime_scope.__enter__()
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -11816,8 +11841,8 @@ def _run_prompt_submit(
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
-            if home_token is not None:
-                reset_hermes_home_override(home_token)
+            if runtime_scope is not None:
+                runtime_scope.__exit__(None, None, None)
             _clear_session_context(session_tokens)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.

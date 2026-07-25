@@ -8417,19 +8417,27 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     is scope-checked rather than leaking another profile's raw ``os.environ``
     value — matching the credential-pool seeding path's behaviour.
     """
-    env_vars = load_env()
-    val = env_vars.get(key)
-    if val:
-        return val
     try:
         from agent.secret_scope import (
             UnscopedSecretError,
+            current_secret_scope,
             get_secret as _get_secret,
+            is_multiplex_active,
         )
     except Exception:
-        return os.environ.get(key)
+        env_vars = load_env()
+        return env_vars.get(key) or os.environ.get(key)
 
     try:
+        # In a shared profile-scoped runtime the local scope is authoritative.
+        # This also replaces an ``op://`` reference in .env with the native
+        # 1Password-resolved value without ever consulting ambient process env.
+        if is_multiplex_active() and current_secret_scope() is not None:
+            return _get_secret(key)
+        env_vars = load_env()
+        val = env_vars.get(key)
+        if val:
+            return val
         return _get_secret(key)
     except UnscopedSecretError:
         raise

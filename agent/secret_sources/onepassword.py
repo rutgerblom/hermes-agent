@@ -47,7 +47,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from agent.secret_sources._cache import (
     CachedFetch,
@@ -172,7 +172,7 @@ def _validate_references(
     return valid, warnings
 
 
-def _auth_fingerprint(token_env: str) -> str:
+def _auth_fingerprint(token_env: str, environ: Mapping[str, str] | None = None) -> str:
     """SHA-256 prefix over the auth material `op` would use.
 
     Folds in the service-account token, ``OP_ACCOUNT``, the 1Password Connect
@@ -183,15 +183,16 @@ def _auth_fingerprint(token_env: str) -> str:
     previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
+    env = environ if environ is not None else os.environ
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
-        f"account={os.environ.get('OP_ACCOUNT', '')}",
-        f"connect_host={os.environ.get('OP_CONNECT_HOST', '')}",
-        f"connect_token={os.environ.get('OP_CONNECT_TOKEN', '')}",
+        f"token={env.get(token_env, '')}",
+        f"account={env.get('OP_ACCOUNT', '')}",
+        f"connect_host={env.get('OP_CONNECT_HOST', '')}",
+        f"connect_token={env.get('OP_CONNECT_TOKEN', '')}",
     ]
-    for key in sorted(os.environ):
+    for key in sorted(env):
         if key.startswith("OP_SESSION_"):
-            parts.append(f"{key}={os.environ[key]}")
+            parts.append(f"{key}={env[key]}")
     material = "\n".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -234,15 +235,18 @@ def _scrub(text: str) -> str:
     return _ANSI_CSI_RE.sub("", text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
+def _op_child_env(
+    token_value: str, environ: Mapping[str, str] | None = None
+) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
+    source = environ if environ is not None else os.environ
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
-        val = os.environ.get(key)
+        val = source.get(key)
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
-    for key, val in os.environ.items():
+    for key, val in source.items():
         if key.startswith("OP_SESSION_"):
             env[key] = val
     # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user
@@ -259,6 +263,7 @@ def _run_op_read(
     *,
     account: str = "",
     token_value: str = "",
+    environ: Mapping[str, str] | None = None,
 ) -> str:
     """Resolve a single ``op://`` reference to its value.
 
@@ -276,7 +281,7 @@ def _run_op_read(
     try:
         proc = subprocess.run(  # noqa: S603 — op path is user-trusted, argv list
             cmd,
-            env=_op_child_env(token_value),
+            env=_op_child_env(token_value, environ),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -323,6 +328,7 @@ def fetch_onepassword_secrets(
     use_cache: bool = True,
     cache_ttl_seconds: float = 300,
     home_path: Optional[Path] = None,
+    environ: Mapping[str, str] | None = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
@@ -338,9 +344,10 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    env = environ if environ is not None else os.environ
+    token_value = env.get(token_env, "").strip()
     cache_key: _CacheKey = (
-        _auth_fingerprint(token_env),
+        _auth_fingerprint(token_env, env),
         account or "",
         str(home_path) if home_path is not None else "",
         _refs_fingerprint(valid),
@@ -369,7 +376,11 @@ def fetch_onepassword_secrets(
     for name in sorted(valid):
         try:
             secrets[name] = _run_op_read(
-                op, valid[name], account=account, token_value=token_value
+                op,
+                valid[name],
+                account=account,
+                token_value=token_value,
+                environ=env,
             )
         except RuntimeError as exc:
             warnings.append(str(exc))
@@ -594,6 +605,8 @@ class OnePasswordSource(SecretSource):
             ttl = 300.0
 
         try:
+            from agent.secret_scope import current_secret_scope
+
             secrets, fetch_warnings = fetch_onepassword_secrets(
                 references=valid,
                 account=str(cfg.get("account") or ""),
@@ -603,6 +616,7 @@ class OnePasswordSource(SecretSource):
                 binary=binary,
                 cache_ttl_seconds=ttl,
                 home_path=home_path,
+                environ=current_secret_scope(),
             )
         except RuntimeError as exc:
             result.error = str(exc)

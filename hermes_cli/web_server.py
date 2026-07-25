@@ -3290,6 +3290,23 @@ async def get_status(profile: Optional[str] = None):
             "nous_session_valid": nous_session_valid,
         }
 
+        # A neutral machine dashboard has no gateway of its own. When Hermes
+        # runs independent gateways per named profile, its unscoped status is
+        # the machine gateway rollup rather than the intentionally absent
+        # default-profile gateway. Profile-targeted status remains local.
+        topology = await asyncio.get_running_loop().run_in_executor(
+            None, _collect_profile_gateway_topology
+        )
+        if (
+            not requested_profile
+            and topology["gateway_mode"] == "multiple"
+            and topology["gateways"]
+        ):
+            gateway_running = True
+            gateway_state = "running"
+            status["gateway_running"] = gateway_running
+            status["gateway_state"] = gateway_state
+
         # Component-level health rollup. Counts and status enums only — this
         # payload is public (PUBLIC_API_PATHS), so no messages, paths, or
         # other detail that could carry secrets. The storage probe reuses the
@@ -3366,9 +3383,6 @@ async def get_status(profile: Optional[str] = None):
         # the network (a gated bind), so they must survive the auth gate. The
         # per-gateway ``gateways[]`` detail carries host ports (deployment
         # recon), so it stays gated with the host paths / PID below.
-        topology = await asyncio.get_running_loop().run_in_executor(
-            None, _collect_profile_gateway_topology
-        )
         status["profiles"] = topology["profiles"]
         status["gateway_mode"] = topology["gateway_mode"]
 

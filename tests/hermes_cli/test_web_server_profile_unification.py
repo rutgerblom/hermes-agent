@@ -548,6 +548,32 @@ class TestProfileScopedGateway:
         assert seen_homes[0] == str(isolated_profiles["worker_beta"])
         assert resp.json()["hermes_home"] == str(isolated_profiles["worker_beta"])
 
+    def test_machine_status_rolls_up_multiple_profile_gateways(
+        self, client, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda *a, **k: None)
+        monkeypatch.setattr(web_server, "read_runtime_status", lambda *a, **k: None)
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+        monkeypatch.setattr(
+            web_server,
+            "_collect_profile_gateway_topology",
+            lambda: {
+                "profiles": ["default", "worker_beta"],
+                "gateway_mode": "multiple",
+                "gateways": [{"profile": "worker_beta"}],
+            },
+        )
+
+        data = client.get("/api/status").json()
+
+        assert data["gateway_running"] is True
+        assert data["gateway_state"] == "running"
+        assert data["components"]["gateway"]["status"] == "ok"
+        assert data["overall"] == "ok"
+
     def test_status_uses_runtime_pid_when_profile_pid_file_is_missing(
         self, client, isolated_profiles, monkeypatch
     ):
