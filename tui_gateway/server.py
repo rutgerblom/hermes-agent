@@ -2242,7 +2242,7 @@ def _ensure_session_db_row(session: dict) -> None:
     # so resume restores effort + fast too, not just the model name.
     override = session.get("model_override")
     override = override if isinstance(override, dict) else {}
-    row_model = str(override.get("model") or "").strip() or _resolve_model()
+    row_model = str(override.get("model") or "").strip() or _initial_session_model(session)
     model_config: dict = {}
     for src_key, cfg_key in (
         ("model", "model"),
@@ -2850,6 +2850,32 @@ def _resolve_model() -> str:
         return get_preferred_silent_default_model()
     except Exception:
         return "z-ai/glm-5.2"
+
+
+def _initial_session_model(session: dict) -> str:
+    """Resolve a new session row's default model from its selected profile.
+
+    A shared dashboard persists a selected profile's first session row before
+    the agent build enters its long-lived runtime scope. The row therefore
+    enters the selected profile scope itself and reads only its config, never
+    the neutral dashboard's ambient launch-model variables.
+    """
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        # Standalone TUI retains its documented launch-seed behavior.
+        return _resolve_model()
+    with profile_runtime_scope(profile_home):
+        model, _provider = _config_model_target()
+        if model:
+            return model
+        # Match the regular resolver's cost-safe no-config fallback without
+        # consulting ambient HERMES_MODEL/HERMES_INFERENCE_MODEL values.
+        try:
+            from hermes_cli.models import get_preferred_silent_default_model
+
+            return get_preferred_silent_default_model()
+        except Exception:
+            return "z-ai/glm-5.2"
 
 
 def _resolve_session_platform() -> str:
@@ -11048,7 +11074,9 @@ def _notification_poller_loop(
         if _claim is None:
             continue
         try:
-            _emit("message.start", sid)
+            # _run_prompt_submit owns the sole message.start frame. Emitting one
+            # here as well makes Desktop attempt to link two messages for the
+            # same completion turn.
             if evt.get("type") == "async_delegation":
                 _run_prompt_submit(
                     rid,
@@ -11126,7 +11154,9 @@ def _notification_poller_loop(
         if _claim is None:
             continue
         try:
-            _emit("message.start", sid)
+            # _run_prompt_submit owns the sole message.start frame. Emitting one
+            # here as well makes Desktop attempt to link two messages for the
+            # same completion turn.
             if evt.get("type") == "async_delegation":
                 _run_prompt_submit(
                     rid,
@@ -11924,8 +11954,18 @@ def _run_prompt_submit(
                 if _claim is None:
                     continue
                 try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    # _run_prompt_submit owns the sole message.start frame.
+                    if _evt.get("type") == "async_delegation":
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            display_kind="async_delegation_complete",
+                            display_metadata=_async_delegation_display_metadata(_evt),
+                        )
+                    else:
+                        _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
